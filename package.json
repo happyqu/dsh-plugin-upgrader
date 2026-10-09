@@ -1,0 +1,62 @@
+{
+  "name": "@happyqu/dsh-plugin-upgrader",
+  "version": "0.1.1",
+  "description": "deepseek-harness plugin: list your third-party plugins, check which have newer versions, and upgrade them from the Plugins page",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "upgrade",
+    "update"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/happyqu/dsh-plugin-upgrader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/happyqu/dsh-plugin-upgrader/issues"
+  },
+  "homepage": "https://github.com/happyqu/dsh-plugin-upgrader#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node scripts/verify-all.mjs && node scripts/verify-activation.mjs && node scripts/verify-cordis-e2e.mjs && node scripts/verify-client-render.mjs",
+    "test:pack": "node scripts/verify-packed-install.mjs",
+    "test:live": "node scripts/verify-live.mjs",
+    "prepublishOnly": "npm test && npm run test:pack"
+  },
+  "license": "MIT"
+}

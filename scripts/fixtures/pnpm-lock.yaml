@@ -1,0 +1,56 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+  excludeLinksFromLockfile: false
+
+# SYNTHETIC fixture: pnpm v9 lockfile shaped like a real profile's, with invented names and
+# URLs. It exists so the lockfile parser is exercised against all three dependency shapes
+# (registry range, git, link:) without shipping one user's real dependencies.
+
+importers:
+
+  .:
+    dependencies:
+      '@example/registry-plugin':
+        specifier: ^0.1.0
+        version: 0.1.0
+      '@example/another-registry-plugin':
+        specifier: ^0.1.3
+        version: 0.1.3
+      example-git-plugin:
+        specifier: https://git.example.com/team/example-git-plugin.git
+        version: git+https://git.example.com/team/example-git-plugin.git#0123456789abcdef0123456789abcdef01234567
+      example-local-plugin:
+        specifier: link:./vendor/example-local-plugin
+        version: link:./vendor/example-local-plugin
+
+packages:
+
+  '@example/registry-plugin@0.1.0':
+    resolution: {integrity: sha512-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSS==, tarball: https://registry.example.com/@example/registry-plugin/-/registry-plugin-0.1.0.tgz}
+    engines: {node: ^22.19.0 || >=24.0.0}
+
+  '@example/another-registry-plugin@0.1.3':
+    resolution: {integrity: sha512-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSS==}
+    engines: {node: ^22.19.0 || >=24.0.0}
+
+  example-git-plugin@git+https://git.example.com/team/example-git-plugin.git#0123456789abcdef0123456789abcdef01234567:
+    resolution: {commit: 0123456789abcdef0123456789abcdef01234567, repo: https://git.example.com/team/example-git-plugin.git, type: git}
+    version: 0.2.0
+    engines: {node: ^22.19.0 || >=24.0.0}
+
+  '@example/transitive-dep@1.1.0':
+    resolution: {integrity: sha512-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMMNNNNOOOOPPPPQQQQRRRRSSSS==}
+
+snapshots:
+
+  '@example/registry-plugin@0.1.0': {}
+
+  '@example/another-registry-plugin@0.1.3': {}
+
+  '@example/transitive-dep@1.1.0': {}
+
+  example-git-plugin@git+https://git.example.com/team/example-git-plugin.git#0123456789abcdef0123456789abcdef01234567:
+    dependencies:
+      '@example/transitive-dep': 1.1.0

@@ -1,0 +1,89 @@
+{
+  "_comment": "SYNTHETIC fixture. Shaped exactly like pluginManager.listBundles(), but every name is invented: a public repository must not ship one user's real plugin inventory. `installed: false` marks bundles the installation supplies (official layers); `installed: true` marks the profile's own dependencies, which is the flag discovery filters on.",
+  "total": 8,
+  "entries": [
+    {
+      "name": "@example/base-layer",
+      "version": "0.2.0-rc.2",
+      "description": "supplied by the installation",
+      "enabled": true,
+      "installed": false,
+      "optional": false,
+      "removable": false,
+      "readOnlyReason": "management-required",
+      "rows": [{ "rowId": "core", "moduleName": "@example/base-layer/core", "entryId": "include:core" }]
+    },
+    {
+      "name": "@example/web-layer",
+      "version": "0.2.0-rc.2",
+      "description": "supplied by the installation",
+      "enabled": true,
+      "installed": false,
+      "optional": false,
+      "removable": false,
+      "readOnlyReason": "management-required",
+      "rows": [{ "rowId": "web", "moduleName": "@example/web-layer/web", "entryId": "include:web" }]
+    },
+    {
+      "name": "@example/registry-plugin",
+      "version": "0.1.3",
+      "description": "an invented registry dependency",
+      "enabled": true,
+      "installed": true,
+      "optional": false,
+      "removable": true,
+      "rows": [{ "rowId": "registry-plugin", "moduleName": "@example/registry-plugin", "entryId": "include:registry-plugin" }]
+    },
+    {
+      "name": "@example/another-registry-plugin",
+      "version": "0.1.0",
+      "description": "a second invented registry dependency",
+      "enabled": true,
+      "installed": true,
+      "optional": false,
+      "removable": true,
+      "rows": [{ "rowId": "another", "moduleName": "@example/another-registry-plugin", "entryId": "include:another" }]
+    },
+    {
+      "name": "example-git-plugin",
+      "version": "0.1.0",
+      "description": "an invented git dependency",
+      "enabled": true,
+      "installed": true,
+      "optional": false,
+      "removable": true,
+      "rows": [{ "rowId": "git-plugin", "moduleName": "example-git-plugin", "entryId": "include:git-plugin" }]
+    },
+    {
+      "name": "example-local-plugin",
+      "version": "0.1.0",
+      "description": "an invented link: dependency",
+      "enabled": true,
+      "installed": true,
+      "optional": false,
+      "removable": true,
+      "rows": [{ "rowId": "local", "moduleName": "example-local-plugin", "entryId": "include:local" }]
+    },
+    {
+      "name": "@example/disabled-optional-layer",
+      "version": "0.2.0-rc.2",
+      "description": "an optional layer that is switched off",
+      "enabled": false,
+      "installed": false,
+      "optional": true,
+      "removable": false,
+      "rows": [{ "rowId": "optional", "moduleName": "@example/disabled-optional-layer/optional" }]
+    },
+    {
+      "name": "@example/readonly-layer",
+      "version": "0.2.0-rc.2",
+      "description": "protected from management",
+      "enabled": false,
+      "installed": false,
+      "optional": false,
+      "removable": false,
+      "readOnlyReason": "management-required",
+      "rows": [{ "rowId": "protected", "moduleName": "@example/readonly-layer/protected" }]
+    }
+  ]
+}

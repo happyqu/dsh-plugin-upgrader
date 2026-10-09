@@ -1,0 +1,20 @@
+{
+  "name": "dsh-profile-e2e-fixture",
+  "_comment": "SYNTHETIC profile used by the Cordis end-to-end test. Invented names and a reserved-domain git URL, so the test exercises all three dependency shapes without shipping real ones.",
+  "private": true,
+  "dependencies": {
+    "demo-plugin": "^1.0.0",
+    "git-plugin": "https://git.example.com/team/git-plugin.git",
+    "local-plugin": "link:./vendor/local-plugin"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@example/base-layer",
+        "demo-plugin",
+        "git-plugin",
+        "local-plugin"
+      ]
+    }
+  }
+}

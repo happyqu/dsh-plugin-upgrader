@@ -1,0 +1,8 @@
+# @happyqu/dsh-plugin-upgrader 配置补丁：在空配置根上追加插件行。
+# 后续配置补丁可通过 id 引用此行来改配置，例如：
+#   - id: plugin-upgrader
+#     config:
+#       ignored: ['some-package']
+- insert:
+    - id: plugin-upgrader
+      name: '@happyqu/dsh-plugin-upgrader'
