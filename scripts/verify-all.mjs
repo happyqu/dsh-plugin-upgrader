@@ -20,7 +20,8 @@ import {
   parseLockfileImporters,
 } from '../lib/shapes.js'
 import { bumpKind, compareVersions, isNewer, parseVersion, rangeOperator } from '../lib/semver.js'
-import { interpretResult } from '../lib/upgrade.js'
+import { packageNameFromAllowBuildsKey } from '../lib/authorization.js'
+import { UpgradeTracker, interpretResult } from '../lib/upgrade.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
@@ -297,13 +298,99 @@ ok('restart headline says restart', /重启/.test(restart.headline), restart.hea
 is('applied needs no restart', interpretResult({ application: 'applied', target: 'pkg' }).needsRestart, false)
 is('cancelled is distinct', interpretResult({ application: 'cancelled', target: 'pkg' }).state, 'cancelled')
 is('null result is unknown', interpretResult(null).state, 'unknown')
+
+// A pnpm run can exit 0 having changed NOTHING. Observed live: `pnpm add <bare-git-url>` printed
+// "Already up to date" and left the lockfile on the old commit, while installBundle returned
+// `restart-required`. Reporting that as an update would be a lie, so a failed verification must
+// override the success branches.
+console.log('\n# a verified no-op must not be reported as an update')
+const noop = interpretResult(
+  { application: 'restart-required', target: 'pkg' },
+  { verification: { changed: false, installedVersion: '1.0.0', expected: '1.0.0', note: '没有变化' } },
+)
+is('a no-op gets its own state', noop.state, 'no-op')
+is('a no-op must not claim a restart is needed', noop.needsRestart, false)
+ok('a no-op headline says no change', /没有变化/.test(noop.headline), noop.headline)
+ok('a no-op carries the verifier note', /没有变化/.test(noop.detail), noop.detail)
+
+const confirmed = interpretResult(
+  { application: 'restart-required', target: 'pkg' },
+  { verification: { changed: true, installedVersion: '1.1.0', expected: '1.1.0', note: null } },
+)
+is('a confirmed change still reports restart-required', confirmed.state, 'restart-required')
+
+// An INCONCLUSIVE verification (changed === null, e.g. the re-read itself failed) must NOT
+// downgrade a real success: the plugin simply cannot confirm it, which is not the same as a no-op.
+const inconclusive = interpretResult(
+  { application: 'restart-required', target: 'pkg' },
+  { verification: { changed: null, installedVersion: null, expected: '1.1.0', note: '无法复核' } },
+)
+is('an inconclusive verification keeps the success state', inconclusive.state, 'restart-required')
+is('an inconclusive verification still claims restart', inconclusive.needsRestart, true)
+
+// No verifier at all (the caller supplied none) must behave exactly as before.
+is(
+  'no verification leaves the verdict untouched',
+  interpretResult({ application: 'restart-required', target: 'pkg' }, {}).state,
+  'restart-required',
+)
+is(
+  'a no-op check applies only to success states',
+  interpretResult(
+    { application: 'cancelled', target: 'pkg' },
+    { verification: { changed: false } },
+  ).state,
+  'cancelled',
+)
+
+// verifyOutcome compares the RIGHT thing per dependency shape. For a git dependency
+// `installedVersion` is not a version at all — the runtime reports the git depPath there — so a
+// version comparison would always be false and every git upgrade would look like a no-op.
+console.log('\n# verifyOutcome compares the right thing per shape')
+const tracker = new UpgradeTracker({ ctx: { on: () => () => {} }, pluginManager: {} })
+
+const registryVerified = await tracker.verifyOutcome('pkg', '1.1.0', async () => ({
+  installedVersion: '1.1.0', status: 'current',
+}))
+is('a registry target compares the version', registryVerified.changed, true)
+
+const registryUnchanged = await tracker.verifyOutcome('pkg', '1.1.0', async () => ({
+  installedVersion: '1.0.0', status: 'outdated',
+}))
+is('a registry target that did not move is a no-op', registryUnchanged.changed, false)
+ok('the no-op note explains itself', /空操作/.test(registryUnchanged.note ?? ''), String(registryUnchanged.note))
+
+// The git case: label is a display string and installedVersion is a depPath, so only the STATUS
+// may be trusted. A status of `current` means the pin moved.
+const gitVerified = await tracker.verifyOutcome('pkg', '远端最新提交', async () => ({
+  installedVersion: 'git+https://git.example.com/a/b.git#0123456789abcdef',
+  status: 'current',
+}))
+is('a git target trusts the status, not the version', gitVerified.changed, true)
+
+const gitUnchanged = await tracker.verifyOutcome('pkg', '远端最新提交', async () => ({
+  installedVersion: 'git+https://git.example.com/a/b.git#0123456789abcdef',
+  status: 'outdated',
+}))
+is('a git target still outdated is a no-op', gitUnchanged.changed, false)
+
+// A verifier that throws must NOT be reported as a no-op: "could not confirm" is not "did nothing".
+const threw = await tracker.verifyOutcome('pkg', '1.1.0', async () => {
+  throw new Error('profile unreadable')
+})
+is('a failing verifier reports inconclusive', threw.changed, null)
+ok('a failing verifier explains itself', /无法复核/.test(threw.note ?? ''), String(threw.note))
+
+// No verifier means no opinion, which must not be mistaken for "changed".
+is('no verifier yields no verification', await tracker.verifyOutcome('pkg', '1.1.0', undefined), null)
+is('a verifier returning nothing yields no verification', await tracker.verifyOutcome('pkg', '1.1.0', async () => null), null)
+
 const incompatible = interpretResult({
   application: 'failed',
   target: 'pkg',
   error: { incompatible: [{ name: 'pkg', version: '9.9.9', runtimeVersion: '0.2.0-rc.2', peers: {} }] },
 })
-ok('incompatible carries the allow-version hint', /allow-version/.test(incompatible.detail), incompatible.detail)
-// The hint must NOT hard-code a profile name: profiles can be called anything, and a wrong
+ok('incompatible carries the allow-version hint', /allow-version/.test(incompatible.detail), incompatible.detail)// The hint must NOT hard-code a profile name: profiles can be called anything, and a wrong
 // `--profile` is worse than none. It appears only when the caller supplies the real name.
 ok('the hint omits --profile when the name is unknown', !/--profile/.test(incompatible.detail), incompatible.detail)
 const incompatibleNamed = interpretResult({
@@ -314,10 +401,106 @@ const incompatibleNamed = interpretResult({
 ok('the hint names the profile when the caller knows it', /--profile my-profile/.test(incompatibleNamed.detail), incompatibleNamed.detail)
 const pending = interpretResult({ application: 'failed', target: 'pkg', pendingBuilds: ['a', 'b'] })
 ok('pendingBuilds are surfaced', /a, b/.test(pending.detail), pending.detail)
-const raw = interpretResult({
+
+// ------------------------------------------------- git build authorization (its own state)
+// This failure needs a hand-made config edit: pnpm's normal "approve builds" flow does NOT cover
+// git dependencies, so `pendingBuilds` stays empty and DSH's approval button cannot help. It must
+// therefore be reported with the exact YAML pnpm itself printed, or the user is stranded.
+console.log('\n# git build authorization is an actionable state, not a generic failure')
+
+/** pnpm's refusal text, shaped exactly as pnpm 11 prints it (verified against a real capture). */
+const GIT_REFUSAL = [
+  '✓ Lockfile passes supply-chain policies (verified 16h ago)',
+  'Progress: resolved 4, reused 1, downloaded 1, added 0',
+  '[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED] Failed to prepare git-hosted package fetched from',
+  '"https://git.example.com/team/tool.git": The git-hosted package "tool@0.2.0" needs to execute',
+  'build scripts but is not in the "allowBuilds" allowlist.',
+  '',
+  'Add the package to "allowBuilds" in your project\'s pnpm-workspace.yaml to allow it to run scripts. For example:',
+  'allowBuilds:',
+  '  tool@git+https://git.example.com/team/tool.git#0123456789abcdef0123456789abcdef01234567: true',
+].join('\n')
+
+const gitVerdict = interpretResult({
+  application: 'failed',
+  target: 'tool',
+  packageResult: { exitCode: 1, output: GIT_REFUSAL },
+})
+is('the git refusal gets its own state', gitVerdict.state, 'needs-authorization')
+ok('the headline names the package', /tool/.test(gitVerdict.headline), gitVerdict.headline)
+ok('the detail explains WHY a git package differs', /git/i.test(gitVerdict.detail), gitVerdict.detail)
+ok('the detail warns about the commit requirement', /commit/i.test(gitVerdict.detail), gitVerdict.detail)
+ok('the detail warns this repeats per commit', /每升一次|每一次/.test(gitVerdict.detail) || /重新授权/.test(gitVerdict.detail), gitVerdict.detail)
+is(
+  'the action carries the exact allowBuilds key from pnpm',
+  gitVerdict.action?.key,
+  'tool@git+https://git.example.com/team/tool.git#0123456789abcdef0123456789abcdef01234567',
+)
+ok('the copyable YAML is a well-formed allowBuilds block', /^allowBuilds:\n {2}\S+: true\n$/.test(gitVerdict.action?.yaml ?? ''), JSON.stringify(gitVerdict.action?.yaml))
+ok('the copyable YAML pins the commit', (gitVerdict.action?.yaml ?? '').includes('#0123456789abcdef'), gitVerdict.action?.yaml)
+
+// A NON-git build refusal must NOT be mistaken for this one: registry packages have a real
+// approval path (`pendingBuilds` + DSH's button), so saying "edit YAML by hand" would be wrong.
+const registryRefusal = interpretResult({
   application: 'failed',
   target: 'pkg',
-  packageResult: { output: 'ERR_PNPM_MINIMUM_RELEASE_AGE something' },
+  pendingBuilds: ['some-registry-pkg'],
+  packageResult: { exitCode: 1, output: 'ERR_PNPM_IGNORED_BUILDS some-registry-pkg' },
+})
+ok('a registry build refusal stays a plain failure', registryRefusal.state === 'failed', registryRefusal.state)
+ok('a registry build refusal keeps the approval path', /批准|官方插件页/.test(registryRefusal.detail), registryRefusal.detail)
+
+// The detector must key off pnpm's stable error CODE, so it still works when the surrounding
+// prose is localized or reworded by a future pnpm.
+const codeOnly = interpretResult({
+  application: 'failed',
+  target: 'tool',
+  packageResult: {
+    exitCode: 1,
+    kind: 'git-dep-prepare-not-allowed',
+    output: 'allowBuilds:\n  tool@git+https://git.example.com/team/tool.git#0123456789abcdef0123456789abcdef01234567: true',
+  },
+})
+is('the error code alone is enough', codeOnly.state, 'needs-authorization')
+is('extraction still yields the key from a code-only match', codeOnly.action?.key,
+  'tool@git+https://git.example.com/team/tool.git#0123456789abcdef0123456789abcdef01234567')
+
+// A SCOPED package name starts with `@`, so the name/specifier boundary is the LAST `@` before
+// `@git+`, not the first. Splitting on the first `@` produced a bogus leading `@` in the message.
+const scopedRefusal = interpretResult({
+  application: 'failed',
+  target: '@scope/tool',
+  packageResult: {
+    exitCode: 1,
+    output: [
+      'ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED nope',
+      'allowBuilds:',
+      '  @scope/tool@git+https://git.example.com/team/tool.git#0123456789abcdef0123456789abcdef01234567: true',
+    ].join('\n'),
+  },
+})
+is('a scoped name resolves correctly', packageNameFromAllowBuildsKey(scopedRefusal.action?.key), '@scope/tool')
+ok('the scoped name is not mangled in the message', scopedRefusal.detail.includes('@scope/tool'), scopedRefusal.detail.split('\n')[0])
+ok('no spurious double-@ appears', !scopedRefusal.detail.includes('@@'), scopedRefusal.detail.split('\n')[0])
+
+// Name extraction must be independent of the refusal shape, since it is also used on its own.
+is('an unscoped key yields its name', packageNameFromAllowBuildsKey('tool@git+https://x/y.git#abc1234'), 'tool')
+is('a key with no git marker yields null', packageNameFromAllowBuildsKey('tool@1.2.3'), null)
+is('a non-string key yields null', packageNameFromAllowBuildsKey(undefined), null)
+
+// A refusal text with no parseable example must degrade to the raw output, never to a bogus action.
+const unparseable = interpretResult({
+  application: 'failed',
+  target: 'tool',
+  packageResult: { exitCode: 1, output: 'ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED something went wrong' },
+})
+is('an unparseable refusal stays a plain failure', unparseable.state, 'failed')
+ok('an unparseable refusal still shows pnpm output', /ERR_PNPM/.test(unparseable.detail), unparseable.detail)
+ok('an unparseable refusal offers no bogus action', unparseable.action === undefined, JSON.stringify(unparseable.action))
+
+const raw = interpretResult({
+  application: 'failed',
+  target: 'pkg',  packageResult: { output: 'ERR_PNPM_MINIMUM_RELEASE_AGE something' },
 })
 ok('pnpm output is passed through verbatim', /minimum|ERR_PNPM_MINIMUM_RELEASE_AGE/.test(raw.detail), raw.detail)
 

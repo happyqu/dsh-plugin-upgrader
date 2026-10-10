@@ -129,6 +129,18 @@ allowBuilds:
 **代价**：远端每前进一个 commit，就要改一次这一行。这是 pnpm 的有意设计
 （授权「某次提交」而不是「某仓库永久」）。
 
+**插件会帮你把这一行准备好**，不用自己去翻日志：遇到这个拒绝时，
+升级结果会显示成 **「需要先授权构建脚本」**，并附带**一键复制**的 YAML ——
+内容直接取自 pnpm 自己的输出，所以 commit 一定是对的。
+
+> 这里**不会**自动替你写授权。授权等于允许那份远端代码在你机器上执行构建脚本，
+> 属于安全决定，必须由你按下复制、自己粘进去。
+
+**为什么不能用官方那个「允许这些脚本并重试」按钮**：那个流程依赖 pnpm 写入
+`allowBuilds: <包名>: "set this to true or false"` 待决标记，而 **git 依赖走的是另一条路径**
+（`preparePackage`），直接抛硬错误，**不写待决标记**。所以对 git 依赖，官方按钮无能为力 ——
+只能手改 YAML。这一点是读 pnpm 源码确认的，不是推测。
+
 > 实测口径：每个候选写法都在**独立 pnpm store** 里跑真实 `pnpm add` 才可信。
 > 共用 store 会得出错误结论 —— 一旦某次构建成功，pnpm 把副作用记在 store 里，
 > 之后同样的安装会**跳过构建**，也就跳过了 `allowBuilds` 检查，于是看起来「裸包名也行」。
@@ -180,6 +192,25 @@ if (Object.hasOwn(before, name)) return "restart-required"
 > *"installed plugins do not update automatically: upgrading means uninstalling and installing the new version."*
 
 所以「升级成功」和「已生效」在本插件里是**两个不同的状态**。
+
+### 升级后会「复核」一次，空操作不会被报成成功
+
+`installBundle` 返回 `restart-required` **不等于磁盘真的变了**。实测遇到过一次：
+`pnpm add <裸git地址>` 打印 `Already up to date`、退出码 0、锁文件仍指向旧 commit，
+而 `installBundle` 照样报告 `restart-required`。
+
+**静默空操作是最糟的失败模式** —— UI 会说「已更新」，实际什么都没动。
+所以升级结束会**重新读一次该插件的真实状态**：
+
+| 复核结果 | 界面显示 |
+|---|---|
+| 确实变了 | 「已更新，重启后生效」 |
+| **没变** | **「没有变化（空操作）」** + 原因说明 |
+| 复核本身失败 | 保持原状态（「无法确认」≠「没做」） |
+
+复核按依赖形态比较不同的东西：registry 比版本号；**git 依赖比状态**，
+因为运行时对 git 依赖报的 `installedVersion` 是 depPath 而非版本号，
+拿它比版本号会永远判成「没变」。
 
 ---
 
