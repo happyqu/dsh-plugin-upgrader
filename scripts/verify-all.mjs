@@ -16,6 +16,8 @@ import {
   SHAPE,
   classifySpecifier,
   commitFromResolved,
+  gitRefOf,
+  gitUpgradeSpec,
   gitUrlOf,
   parseLockfileImporters,
 } from '../lib/shapes.js'
@@ -136,6 +138,57 @@ is('commitFromResolved', commitFromResolved(`git+https://git.example.com/a/b.git
 is('commitFromResolved: none', commitFromResolved('link:./vendor/x'), null)
 is('gitUrlOf strips git+ and hash', gitUrlOf('git+https://git.example.com/a/b.git#0123456'), 'https://git.example.com/a/b.git')
 is('gitUrlOf rejects link', gitUrlOf('link:./vendor/x'), null)
+
+// ---------------------------------------------------------- the git upgrade spec contract
+// Two independent requirements, each verified against a real profile with pnpm 11.7.0.
+// Getting EITHER wrong turns a real upgrade into a failure that looks like success:
+//
+//   name-qualified — DSH's `installBundle` attributes a run by diffing the profile's
+//     `dependencies` before and after pnpm. A git reinstall writes the same URL back, so the
+//     diff is empty and the manager falls back to matching the spec against dependency NAMES.
+//     A bare URL matches nothing, so it throws `ambiguous-install` and reports
+//     `application: 'failed'` — AFTER pnpm already exited 0. This is the failure the user hit:
+//     a green pnpm log followed by "升级失败".
+//   commit-pinned  — pnpm treats an unpinned git specifier, a branch ref, and `HEAD` all as
+//     already satisfied by the lockfile's commit: "Already up to date", exit 0, no
+//     re-resolution. Re-installing the unpinned URL therefore cannot upgrade past the first
+//     time; it is a silent no-op that repeats forever.
+console.log('\n# the git upgrade spec must be name-qualified AND commit-pinned')
+const GIT_URL = 'https://git.example.com/team/tool.git'
+const GIT_SHA = '0123456789abcdef0123456789abcdef01234567'
+
+const plainGitSpec = gitUpgradeSpec({ name: 'tool', url: GIT_URL, commit: GIT_SHA, declared: GIT_URL })
+is('a bare-url dependency yields name@url#commit', plainGitSpec, `tool@${GIT_URL}#${GIT_SHA}`)
+ok('the spec is name-qualified (DSH can attribute it)', plainGitSpec.startsWith('tool@'), plainGitSpec)
+ok('the spec is commit-pinned (pnpm must re-resolve)', plainGitSpec.endsWith(`#${GIT_SHA}`), plainGitSpec)
+
+// A `git+` declaration keeps its own style, so an upgrade does not rewrite the user's manifest.
+const gitPlusSpec = gitUpgradeSpec({ name: 'tool', url: GIT_URL, commit: GIT_SHA, declared: `git+${GIT_URL}` })
+is('a git+ dependency keeps its git+ style', gitPlusSpec, `tool@git+${GIT_URL}#${GIT_SHA}`)
+
+// A scoped name must not confuse the name/specifier boundary.
+const scopedGitSpec = gitUpgradeSpec({ name: '@scope/tool', url: GIT_URL, commit: GIT_SHA, declared: GIT_URL })
+is('a scoped name stays intact', scopedGitSpec, `@scope/tool@${GIT_URL}#${GIT_SHA}`)
+
+// A stale pin in the declaration must never survive into the new spec: two `#` fragments would
+// be a malformed specifier, and keeping the old pin is the no-op we are fixing.
+const staleDeclared = `${GIT_URL}#89abcdef0123456789abcdef0123456789abcdef`
+const repinned = gitUpgradeSpec({ name: 'tool', url: GIT_URL, commit: GIT_SHA, declared: staleDeclared })
+is('a stale pin is replaced, not appended to', repinned, `tool@${GIT_URL}#${GIT_SHA}`)
+is('the new spec carries exactly one # fragment', repinned.split('#').length - 1, 1)
+
+// Which ref to read. A commit fragment is a pin, not a moving ref, so it must fall back to
+// HEAD; a branch or tag must be queried by name. Reading HEAD for a `#develop` dependency
+// would pin the upgrade to the wrong branch's code.
+is('no fragment means HEAD', gitRefOf(GIT_URL), null)
+is('a commit fragment is not a ref', gitRefOf(`${GIT_URL}#${GIT_SHA}`), null)
+is('a short commit fragment is not a ref', gitRefOf(`${GIT_URL}#89abcdef`), null)
+is('a branch is a ref', gitRefOf(`${GIT_URL}#develop`), 'develop')
+is('a tag is a ref', gitRefOf(`${GIT_URL}#v1.2.3`), 'v1.2.3')
+is('a slashed branch is a ref', gitRefOf(`${GIT_URL}#feature/x`), 'feature/x')
+is('git+ does not confuse ref extraction', gitRefOf(`git+${GIT_URL}#develop`), 'develop')
+is('an empty fragment means HEAD', gitRefOf(`${GIT_URL}#`), null)
+is('a non-string yields no ref', gitRefOf(undefined), null)
 
 console.log('\n# lockfile parsing (synthetic fixture, all three shapes)')
 const lockText = await readFile(join(root, 'scripts', 'fixtures', 'pnpm-lock.yaml'), 'utf8')
@@ -373,6 +426,47 @@ const gitUnchanged = await tracker.verifyOutcome('pkg', '远端最新提交', as
   status: 'outdated',
 }))
 is('a git target still outdated is a no-op', gitUnchanged.changed, false)
+
+// A git upgrade now names the exact commit it installed, so the re-read can be exact rather
+// than inferring from a status: the pin must BE the requested commit. This is also what catches
+// "the commit I asked for was already installed", where the status alone would look fine.
+const COMMIT_TARGET = '0123456789abcdef0123456789abcdef01234567'
+const commitMatched = await tracker.verifyOutcome('pkg', COMMIT_TARGET, async () => ({
+  installedVersion: `git+https://git.example.com/a/b.git#${COMMIT_TARGET}`,
+  status: 'current',
+  pinnedCommit: COMMIT_TARGET,
+}))
+is('a commit target is confirmed against the pinned commit', commitMatched.changed, true)
+
+const commitNotMoved = await tracker.verifyOutcome('pkg', COMMIT_TARGET, async () => ({
+  installedVersion: 'git+https://git.example.com/a/b.git#89abcdef0123456789abcdef0123456789abcdef',
+  status: 'current',
+  pinnedCommit: '89abcdef0123456789abcdef0123456789abcdef',
+}))
+is('a commit target that did not move is a no-op', commitNotMoved.changed, false)
+
+// A short label (what the UI shows) must still match the full commit the lockfile records.
+const shortLabel = COMMIT_TARGET.slice(0, 7)
+const shortMatched = await tracker.verifyOutcome('pkg', shortLabel, async () => ({
+  installedVersion: `git+https://git.example.com/a/b.git#${COMMIT_TARGET}`,
+  status: 'current',
+  pinnedCommit: COMMIT_TARGET,
+}))
+is('a short commit label matches the full pin', shortMatched.changed, true)
+
+// With no `pinnedCommit` readable, the answer must be "cannot confirm" (null), NOT "did
+// nothing": for a git dependency the status is derived FROM the pin, so a missing pin leaves
+// the status saying `current` no matter what happened. Reporting `changed: false` there would
+// turn a successful install into a claimed no-op.
+const noPinCommit = await tracker.verifyOutcome('pkg', COMMIT_TARGET, async () => ({
+  installedVersion: 'git+https://git.example.com/a/b.git#0123456789abcdef',
+  status: 'current',
+}))
+is('a commit target with no readable pin is inconclusive, not a no-op', noPinCommit.changed, null)
+ok('the inconclusive note says it could not confirm', /无法确认/.test(noPinCommit.note ?? ''), String(noPinCommit.note))
+
+// It must NOT be the generic no-op wording, which would claim nothing changed.
+ok('the inconclusive note does not claim a no-op', !/空操作/.test(noPinCommit.note ?? ''), String(noPinCommit.note))
 
 // A verifier that throws must NOT be reported as a no-op: "could not confirm" is not "did nothing".
 const threw = await tracker.verifyOutcome('pkg', '1.1.0', async () => {

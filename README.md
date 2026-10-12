@@ -90,13 +90,66 @@ profile 的 `package.json` 里，依赖有四种形态，**「最新版本」的
 | 形态 | 例子 | 检查方式 | 升级时实际装什么 |
 |---|---|---|---|
 | `registry` | `^0.1.3` | 问注册表最新版，做 semver 比较 | `名字@新版本` |
-| `git` | `https://…/repo.git` | lockfile 里的 commit ↔ 远端 HEAD | **不带 pin 的仓库 URL**（让 pnpm 重新解析 HEAD） |
+| `git` | `https://…/repo.git` | lockfile 里的 commit ↔ 远端 HEAD | **`名字@仓库地址#远端HEAD`**（名字**和** commit 都必须在） |
 | `link` | `link:D:/my/plugin` | **没有远端，问不出来** | ❌ 不升，标注「本地依赖，自行管理」 |
 | `file` | `file:../x.tgz` | 同上 | ❌ 同上 |
 
 对 `link:` 依赖跑 `pnpm view` 毫无意义；对 git 依赖问 npm 版本号也不对。
 所以插件**先判定形态，再决定用哪条路径** —— 而且这个判断**只在 Host 半发生一次**，
 浏览器那一侧只负责显示，不参与形态判断。
+
+### git 依赖的升级 spec：两个条件缺一不可
+
+git 依赖的安装 spec 是 `名字@仓库地址#commit`。这三段**都是承重的**，而且
+**少任何一段都会得到一个「看起来像成功」的失败**。两条都是对着真实 profile + pnpm 11.7.0
+实测出来的，不是推测：
+
+| 少了什么 | pnpm 的表现 | 你以为发生了什么 | 实际发生了什么 |
+|---|---|---|---|
+| **`名字@`** | **exit 0，一切正常** | 升级成功 | DSH 报 `ambiguous-install` → **「升级失败」**，且把 `package.json`/`pnpm-lock.yaml` **回滚** |
+| **`#commit`** | exit 0，打印 `Already up to date` | 升级成功 | **什么都没动**，lockfile 仍是旧 commit |
+
+**为什么 `名字@` 不能省**：`installBundle` 靠**对比 pnpm 前后 profile 的 `dependencies`**
+来判断「这次装的是哪个包」。而 git 依赖重装后写回的是**同一个 URL**，所以这个 diff 是**空的**；
+于是它退回去用 spec 去匹配**依赖名**（`spec === n || spec.startsWith(n + '@')`）。
+裸 URL 匹配不上任何名字 → `installed.length === 0` → 抛 `ambiguous-install`。
+**关键：这件事发生在 pnpm 已经退出 0 之后** —— 所以日志一片绿，结果却是「升级失败」。
+
+**为什么 `#commit` 不能省**：pnpm 认为「不带 pin 的 git 地址」（以及 `#分支名`、`#HEAD`）
+**已经被 lockfile 里那个 commit 满足了**。于是它打印 `Already up to date`、退出 0、
+**根本不去重新解析分支**。也就是说：**重装裸 URL 只能升级第一次，之后永远静默空操作。**
+
+> 实测（每个候选写法都在真实 profile 上跑过）：`名字@git+地址` 第一次能走通，
+> 但第二次起 lockfile 不再移动；`名字@地址#master`、`#HEAD` 同样第二次起不动；
+> **只有 `名字@地址#<具体commit>` 每次都真的移动。**
+
+**钉 commit 不等于永久冻结**：插件**每次升级都重新读一次远端 HEAD**，然后把这个 pin 重写。
+所以下一次仍然跟着走。钉的如果是 lockfile 里**已有的**那个 commit，才是空操作。
+
+### 一个必须说明的取舍：跟踪分支的依赖
+
+如果依赖写的是 `地址#分支名`（例如 `#develop`），插件**会按那个分支去查**
+（`git ls-remote <url> develop`，不是 HEAD），然后**把该分支当前的 commit 钉进去**。
+
+代价是：**升级之后，manifest 里记录的就是 commit，不再是分支名。**
+这是 pnpm 的语义逼出来的，不是插件的选择。实测规律只有一条：
+
+> **pnpm 只在「请求的 specifier 与 lockfile 里记的 specifier 不同」时才重新解析。**
+
+于是所有「重发同一个字符串」的写法都会静默空操作：
+
+| 写法 | 重复升级时会怎样 |
+|---|---|
+| `#分支名`（原样重发） | ❌ 静默空操作，lockfile 永远不动 |
+| `#HEAD` | ❌ 同上 |
+| **`#<具体commit>`** | ✅ **每次都动**（每次的 commit 都不同） |
+
+（也测过「每次翻转 `git+` 前缀」这种让字符串持续变化的写法：**确实能每次都动**，
+但它每升一次就把用户的 manifest 风格改写一次，属于钻空子，插件**不采用**。）
+
+所以如果你**必须**让依赖一直跟着某个分支走（而不是某个提交），
+请不要用本插件升它 —— 升级后请自己把 manifest 改回 `地址#分支名`。
+这一点在 UI 上无法完全替你表达，所以写在这里。
 
 ### git 依赖升级会被 `allowBuilds` 拦住（需要授权构建脚本）
 
@@ -208,9 +261,14 @@ if (Object.hasOwn(before, name)) return "restart-required"
 | **没变** | **「没有变化（空操作）」** + 原因说明 |
 | 复核本身失败 | 保持原状态（「无法确认」≠「没做」） |
 
-复核按依赖形态比较不同的东西：registry 比版本号；**git 依赖比状态**，
-因为运行时对 git 依赖报的 `installedVersion` 是 depPath 而非版本号，
-拿它比版本号会永远判成「没变」。
+复核按依赖形态比较不同的东西：registry 比版本号；**git 依赖比 commit** ——
+因为升级 spec 现在明确写了要装哪个 commit，所以复核就是「重新读出来的 pin 是不是那个 commit」。
+这比只看状态更严格：状态说不出「pin 移到了我要的那个」和「pin 移到了别处」的区别，
+也抓不住「我要的 commit 本来就是当前这个」这种真空操作。
+
+万一读不到当前 commit，结论是**「无法确认」而不是「没做」** ——
+因为 git 依赖的状态本身就是从 pin 算出来的，读不到 pin 时状态什么也证明不了。
+把它当成空操作会把一次成功的安装报成「什么都没变」。
 
 ---
 
@@ -263,8 +321,14 @@ node scripts/probe-allowbuilds-isolated.mjs  # 逐个候选写法测 allowBuilds
 - **自动发现**（官方层必须被排除）
 - 缓存的 TTL / 并发上限 / 请求去重 / **失败不污染上次成功结果**
 - **终态归一**（`restart-required` 必须是独立状态）
+- **git 升级 spec 的两个条件**（必须带名字、必须钉 commit；含「旧 pin 不能被追加成两个 `#`」、
+  以及「`#分支` 要按分支查、`#commit` 要退回 HEAD」）
+- **commit 复核**（pin 必须等于要装的那个 commit；读不到 pin 时是「无法确认」而非「没做」）
 - **配置必须是 Standard Schema**（含负向对照：普通对象必须被 Cordis 拒绝）
 - 真实 **Cordis Context** 加载、真服务注入、真 RPC 调用
+- **端到端 git 升级**：`verify-cordis-e2e.mjs` 用一个带 git 依赖的合成 profile 跑完整流程，
+  并**断言 pnpm 实际收到的 spec 形态** —— 因为上面那两个条件一旦写错，
+  表现都是「pnpm 退出码 0」，只看退出码是抓不到的
 
 ### 已知开发摩擦：Host 半改完要重启
 

@@ -9,8 +9,9 @@
  *
  * Run: node scripts/verify-cordis-e2e.mjs
  */
-import { existsSync } from 'node:fs'
+import { existsSync, cpSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 
 import { cordisEntry } from './lib/env.mjs'
@@ -49,6 +50,28 @@ console.log('\n# real Cordis Context, real service resolution')
 const registeredRoutes = []
 
 const root = new cordis.Context()
+
+/**
+ * The profile this test runs against: a COPY of the fixture.
+ *
+ * A faithful git install rewrites `pnpm-lock.yaml`, and a fixture committed to the repository
+ * must not be mutated by running the tests, so every run works on a throwaway copy.
+ */
+const FIXTURE_PROFILE = join(import.meta.dirname, 'fixtures', 'e2e-profile')
+const PROFILE_DIR = join(tmpdir(), `dsh-upgrader-e2e-${process.pid.toString(36)}`)
+rmSync(PROFILE_DIR, { recursive: true, force: true })
+cpSync(FIXTURE_PROFILE, PROFILE_DIR, { recursive: true })
+
+/** The commit the fixture lockfile currently pins, and the newer one the fake remote reports. */
+const PINNED_BEFORE = '89abcdef0123456789abcdef0123456789abcdef'
+const GIT_HEAD = '0123456789abcdef0123456789abcdef01234567'
+
+/** Rewrite the copied lockfile's git pin, exactly as a real `pnpm add <spec>` would. */
+function pinLockfileTo(commit) {
+  const path = join(PROFILE_DIR, 'pnpm-lock.yaml')
+  writeFileSync(path, readFileSync(path, 'utf8').replace(PINNED_BEFORE, commit))
+}
+
 // The plugin declares `inject: ['pluginManager', 'profileContext']`, so those must be
 // provided before the fiber can activate — exactly as the loader's dependency order ensures.
 /** Specs `installBundle` was actually invoked with, in order. */
@@ -67,14 +90,19 @@ root.provide('pluginManager', {
   registries: async () => ({ registry: null, fallbackRegistries: [], resolved: null }),
   installBundle: async (spec) => {
     installSpecs.push(spec)
+    // Simulate what a real `pnpm add <spec>` does to the profile: the requested commit becomes
+    // the pinned one. This is what the plugin's post-install re-read observes, so the verdict
+    // path is exercised for real rather than being asserted against a fixed string.
+    const requested = /#([0-9a-f]{7,40})$/i.exec(String(spec))
+    if (requested !== null) pinLockfileTo(requested[1])
     return { application: 'restart-required', target: spec, bundle: spec }
   },
   cancelInstall: async () => ({ status: 'not-running' }),
 })
 root.provide('profileContext', {
   name: 'desktop',
-  // A fixture profile, so discovery reads a real package.json instead of an empty one.
-  dir: join(import.meta.dirname, 'fixtures', 'e2e-profile'),
+  // The throwaway copy, so a simulated install can rewrite the lockfile safely.
+  dir: PROFILE_DIR,
   installAnchor: 'package.json',
   packageManager: { command: process.execPath, args: ['--expose-internals', 'pnpm.mjs'], env: { ELECTRON_RUN_AS_NODE: '1' } },
 })
@@ -84,6 +112,36 @@ root.provide('connection', {
       registeredRoutes.push(route)
       return () => {}
     },
+  },
+})
+
+/**
+ * A stubbed `subprocess`, so both query paths can be exercised offline.
+ *
+ * A git upgrade MUST read the remote before it can build a spec — the spec names the commit to
+ * install — so pretending there is no subprocess would only prove that the refusal works.
+ * This answers `git ls-remote` and `pnpm view`, and records every argv, so the test can assert
+ * both which ref was asked for and what spec was produced.
+ *
+ * (The "no subprocess at all" degrade path is covered in verify-all.mjs, where it belongs.)
+ */
+const invokedArgv = []
+root.provide('subprocess', {
+  spawn({ argv }) {
+    invokedArgv.push(argv)
+    const isLsRemote = argv[0] === 'git' && argv[1] === 'ls-remote'
+    const isView = argv.includes('view')
+    // A git query answers `<sha>\t<ref>`; a registry query prints the newest version as JSON.
+    const stdout = isLsRemote
+      ? `${GIT_HEAD}\t${String(argv[argv.length - 1])}\n`
+      : isView
+        ? '"1.1.0"\n'
+        : ''
+    const reader = (text) => ({ readFrom: () => ({ text }) })
+    return {
+      done: Promise.resolve({ exitCode: 0 }),
+      collected: { stdout: reader(stdout), stderr: reader('') },
+    }
   },
 })
 
@@ -128,10 +186,8 @@ if (route !== undefined) {
   ok('the git dependency is recognised as such', byName.get('git-plugin')?.shape === 'git', JSON.stringify(byName.get('git-plugin')))
   ok('the link dependency is recognised as such', byName.get('local-plugin')?.shape === 'link', JSON.stringify(byName.get('local-plugin')))
 
-  // No subprocess service is provided in this context, so a registry check must degrade to a
-  // reported error rather than throwing out of the endpoint.
-  ok('a missing subprocess degrades to a reported error', byName.get('demo-plugin')?.status === 'error', JSON.stringify(byName.get('demo-plugin')))
-  ok('the degraded error names the package manager', /pnpm/.test(String(byName.get('demo-plugin')?.message)), String(byName.get('demo-plugin')?.message))
+  // With the stub in place, a registry check resolves normally against the fake registry.
+  ok('the registry dependency resolves against the stub registry', byName.get('demo-plugin')?.status === 'current' || byName.get('demo-plugin')?.status === 'outdated', JSON.stringify(byName.get('demo-plugin')))
 
   // A link dependency is never "outdated": there is no remote to compare with.
   ok('a link dependency reports itself as local', byName.get('local-plugin')?.status === 'local', JSON.stringify(byName.get('local-plugin')))
@@ -141,39 +197,70 @@ if (route !== undefined) {
   ok('summary counts every plugin', summary?.total === 3, JSON.stringify(summary))
 
   // The git case is the regression this contract exists to fix: a git dependency's target is
-  // a COMMIT, so no version number can express it, and the spec must be re-resolved here.
-  ok('a git dependency is marked upgradable when its commit moved', byName.get('git-plugin')?.status === 'error' || byName.get('git-plugin')?.upgradable === true, JSON.stringify(byName.get('git-plugin')))
+  // a COMMIT, so no version number can express it. The fixture lockfile pins an older commit
+  // than the fake remote reports, so this must be `outdated` and upgradable.
+  ok('a git dependency is marked upgradable when its commit moved', byName.get('git-plugin')?.status === 'outdated', JSON.stringify(byName.get('git-plugin')))
+  ok('the git row reports the target commit', byName.get('git-plugin')?.target === GIT_HEAD.slice(0, 7), JSON.stringify(byName.get('git-plugin')?.target))
 
   console.log('\n# the Host resolves the install spec itself')
   const started = await (await route.fetch(envelope('upgrade.start', { name: 'demo-plugin', requestId: 'run-1' }))).json()
-  // `demo-plugin` is a registry dependency and no subprocess exists here, so the version
-  // cannot be determined: the Host must refuse rather than invent a spec.
-  ok('a registry upgrade without a resolvable version is refused', started.result?.ok === false, JSON.stringify(started.result))
-  ok('the refusal explains the version could not be read', /最新版本/.test(String(started.result?.error?.message)), String(started.result?.error?.message))
+  // `demo-plugin` is a registry dependency: the version comes from the registry, so the Host
+  // resolves `name@version` rather than re-installing the range.
+  ok('a registry upgrade resolves to name@version', started.result?.ok === true, JSON.stringify(started.result))
 
   const localStart = await (await route.fetch(envelope('upgrade.start', { name: 'local-plugin', requestId: 'run-local' }))).json()
   ok('a link dependency upgrade is refused', localStart.result?.ok === false, JSON.stringify(localStart.result))
   ok('the link refusal says there is no remote', /本地依赖/.test(String(localStart.result?.error?.message)), String(localStart.result?.error?.message))
 
-  // The git dependency CAN be resolved without a subprocess: its spec is the unpinned URL.
+  // The git dependency CAN be resolved: its spec is the name-qualified, commit-pinned URL.
   const gitStart = await (await route.fetch(envelope('upgrade.start', { name: 'git-plugin', requestId: 'run-git' }))).json()
   ok('a git dependency upgrade is accepted', gitStart.result?.ok === true, JSON.stringify(gitStart.result))
 
-  // Give the fire-and-forget install a turn to start, then inspect what pnpm was asked for.
+  // Give the fire-and-forget installs a turn to start, then inspect what pnpm was asked for.
+  // Two upgrades were started (the registry one and the git one), so isolate the git spec.
   await new Promise((resolve) => setTimeout(resolve, 60))
-  ok('installBundle was called exactly once', installSpecs.length === 1, JSON.stringify(installSpecs))
-  ok('the git spec is the unpinned repository URL', installSpecs[0] === 'https://git.example.com/team/git-plugin.git', String(installSpecs[0]))
-  ok('the git spec carries no commit pin', !String(installSpecs[0]).includes('#'), String(installSpecs[0]))
-  ok('the git spec carries no version suffix', !String(installSpecs[0]).includes('@'), String(installSpecs[0]))
+  const gitInstalls = installSpecs.filter((spec) => String(spec).startsWith('git-plugin@'))
+  ok('the git upgrade asked pnpm for exactly one spec', gitInstalls.length === 1, JSON.stringify(installSpecs))
+
+  // THE REGRESSION THIS CONTRACT EXISTS FOR. Two independent requirements, each measured
+  // against a real profile; violating either one produces a failure that looks like success:
+  //
+  //   name-qualified — otherwise DSH cannot attribute the run (a git reinstall rewrites an
+  //     identical URL, so the before/after diff is empty and the name fallback matches
+  //     nothing), and it reports `ambiguous-install` AFTER pnpm exited 0.
+  //   commit-pinned  — otherwise pnpm treats the spec as already satisfied by the lockfile's
+  //     commit, prints "Already up to date" and never re-resolves. A silent no-op that would
+  //     repeat forever.
+  const gitSpec = String(gitInstalls[0])
+  ok(
+    'the git spec is name-qualified',
+    gitSpec.startsWith('git-plugin@'),
+    gitSpec,
+  )
+  ok(
+    'the git spec is the repository URL, name-qualified',
+    gitSpec === `git-plugin@https://git.example.com/team/git-plugin.git#${GIT_HEAD}`,
+    gitSpec,
+  )
+  ok('the git spec pins the resolved commit', gitSpec.includes(`#${GIT_HEAD}`), gitSpec)
+  ok(
+    'the remote was read before the spec was built',
+    invokedArgv.some((argv) => argv[0] === 'git' && argv[1] === 'ls-remote'),
+    JSON.stringify(invokedArgv),
+  )
 
   const status = await (await route.fetch(envelope('upgrade.status', { requestId: 'run-git' }))).json()
   const run = status.result?.value?.run
   ok('run settled', run?.running === false, JSON.stringify(run))
   ok('upgrade reports restart-required', run?.application === 'restart-required', JSON.stringify(run?.application))
   ok('verdict says restart is needed', status.result?.value?.verdict?.needsRestart === true, JSON.stringify(status.result?.value?.verdict))
+  // The post-install re-read must CONFIRM the pin actually moved. Without the commit-pinned
+  // spec this is exactly the check that reports "no change", so it is the assertion that
+  // proves the silent no-op is gone.
+  ok('the post-install re-read confirms the pin moved', run?.verification?.changed === true, JSON.stringify(run?.verification))
 
   const runs = await (await route.fetch(envelope('upgrade.runs', {}))).json()
-  ok('runs are listable', runs.result?.value?.runs?.length === 1, JSON.stringify(runs.result?.value?.runs))
+  ok('runs are listable', runs.result?.value?.runs?.length === 2, JSON.stringify(runs.result?.value?.runs?.length))
 }
 
 // Dispose the root context: a plugin that leaks a subscription or a fiber would throw here.
@@ -184,6 +271,9 @@ try {
   disposeError = error
 }
 ok('the context disposes cleanly', disposeError === null, disposeError === null ? '' : String(disposeError))
+
+// The profile was a throwaway copy; remove it so repeated runs start clean.
+rmSync(PROFILE_DIR, { recursive: true, force: true })
 
 console.log(`\n${failures === 0 ? 'PASS' : 'FAIL'} — Cordis end-to-end checks`)
 process.exit(failures === 0 ? 0 : 1)

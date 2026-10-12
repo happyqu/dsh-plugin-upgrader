@@ -43,13 +43,17 @@ for (const file of ['package.json', 'pnpm-workspace.yaml', 'pnpm-lock.yaml']) {
   const from = join(PROFILE, file)
   if (existsSync(from)) cpSync(from, join(COPY, file))
 }
-// Junction the real node_modules: copying it would be pointless, and pnpm only needs the
-// directory to exist to reconcile against.
-const realModules = join(PROFILE, 'node_modules')
-const copyModules = join(COPY, 'node_modules')
-if (existsSync(realModules) && process.platform === 'win32') {
-  spawnSync('cmd', ['/c', 'mklink', '/J', copyModules, realModules], { stdio: 'ignore' })
-}
+// Deliberately NO node_modules in the copy.
+//
+// This used to junction the live profile's `node_modules`, which made pnpm refuse outright with
+// `ERR_PNPM_UNEXPECTED_VIRTUAL_STORE`: the junction resolves to the real profile's directory,
+// whose `.pnpm` lives elsewhere, so pnpm saw the modules directory as symlinked from one virtual
+// store while it wanted to link from another. The diagnostic then reported "commit UNCHANGED"
+// for a reason that had nothing to do with the upgrade path it exists to explain — a false
+// negative that nearly hid the real defect.
+//
+// With no modules directory, pnpm links cleanly from the store into this throwaway copy, which
+// is exactly the state a real upgrade starts from.
 
 /** The profile's declared dependencies, read from the copy. */
 const manifest = readJson(join(COPY, 'package.json')) ?? {}
