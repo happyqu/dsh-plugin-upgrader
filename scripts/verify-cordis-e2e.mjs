@@ -52,21 +52,61 @@ const registeredRoutes = []
 const root = new cordis.Context()
 
 /**
- * The profile this test runs against: a COPY of the fixture.
+ * The profile this test runs against: a COPY of the fixture, in a throwaway directory.
  *
  * A faithful git install rewrites `pnpm-lock.yaml`, and a fixture committed to the repository
- * must not be mutated by running the tests, so every run works on a throwaway copy.
+ * must not be mutated by running the tests, so every run works on a copy.
  */
 const FIXTURE_PROFILE = join(import.meta.dirname, 'fixtures', 'e2e-profile')
 const PROFILE_DIR = join(tmpdir(), `dsh-upgrader-e2e-${process.pid.toString(36)}`)
 rmSync(PROFILE_DIR, { recursive: true, force: true })
 cpSync(FIXTURE_PROFILE, PROFILE_DIR, { recursive: true })
 
-/** The commit the fixture lockfile currently pins, and the newer one the fake remote reports. */
+/** The commit the lockfile pins at the start, and the newer one the fake remote reports. */
 const PINNED_BEFORE = '89abcdef0123456789abcdef0123456789abcdef'
 const GIT_HEAD = '0123456789abcdef0123456789abcdef01234567'
 
-/** Rewrite the copied lockfile's git pin, exactly as a real `pnpm add <spec>` would. */
+// The lockfile is WRITTEN HERE rather than copied from a fixture file.
+//
+// It is load-bearing: without a pinned git commit there is no baseline for "is there a new
+// commit?", so `checkCandidate` reports `current`, the upgrade path never runs, and the whole
+// git contract silently stops being tested. That is exactly what happened when this lived as a
+// separate untracked fixture file — it went missing and five assertions failed at once, for a
+// reason (a deleted file) that had nothing to do with the behaviour under test.
+//
+// Generating it in-process makes the test hermetic: the state it asserts on cannot drift from
+// the state it sets up.
+writeFileSync(join(PROFILE_DIR, 'pnpm-lock.yaml'), [
+  "lockfileVersion: '9.0'",
+  '',
+  '# SYNTHETIC, written by verify-cordis-e2e.mjs. The git commit is fabricated: it only has to',
+  '# differ from GIT_HEAD so that "the remote moved" is a real observation.',
+  '',
+  'settings:',
+  '  autoInstallPeers: false',
+  '  excludeLinksFromLockfile: false',
+  '',
+  'importers:',
+  '',
+  '  .:',
+  '    dependencies:',
+  '      demo-plugin:',
+  '        specifier: ^1.0.0',
+  '        version: 1.0.0',
+  '      git-plugin:',
+  '        specifier: https://git.example.com/team/git-plugin.git',
+  `        version: git+https://git.example.com/team/git-plugin.git#${PINNED_BEFORE}`,
+  '      local-plugin:',
+  '        specifier: link:./vendor/local-plugin',
+  '        version: link:./vendor/local-plugin',
+  '',
+].join('\n'))
+
+/**
+ * Rewrite the lockfile's git pin, exactly as a real `pnpm add <spec>` would.
+ * @param {string} commit - the commit to pin.
+ * @returns {void}
+ */
 function pinLockfileTo(commit) {
   const path = join(PROFILE_DIR, 'pnpm-lock.yaml')
   writeFileSync(path, readFileSync(path, 'utf8').replace(PINNED_BEFORE, commit))
