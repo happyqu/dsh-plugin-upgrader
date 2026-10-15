@@ -1,6 +1,6 @@
 {
   "name": "@happyqu/dsh-plugin-upgrader",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "deepseek-harness plugin: list your third-party plugins, check which have newer versions, and upgrade them from the Plugins page",
   "type": "module",
   "main": "lib/index.js",
