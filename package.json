@@ -53,7 +53,7 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "test": "node scripts/verify-all.mjs && node scripts/verify-activation.mjs && node scripts/verify-cordis-e2e.mjs && node scripts/verify-client-render.mjs",
+    "test": "node scripts/verify-all.mjs && node scripts/verify-validation.mjs && node scripts/verify-activation.mjs && node scripts/verify-cordis-e2e.mjs && node scripts/verify-client-render.mjs",
     "test:pack": "node scripts/verify-packed-install.mjs",
     "test:live": "node scripts/verify-live.mjs",
     "prepublishOnly": "npm test && npm run test:pack"

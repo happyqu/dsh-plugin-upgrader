@@ -9,7 +9,7 @@
  *
  * Run: node scripts/verify-cordis-e2e.mjs
  */
-import { existsSync, cpSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, cpSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -61,6 +61,12 @@ const FIXTURE_PROFILE = join(import.meta.dirname, 'fixtures', 'e2e-profile')
 const PROFILE_DIR = join(tmpdir(), `dsh-upgrader-e2e-${process.pid.toString(36)}`)
 rmSync(PROFILE_DIR, { recursive: true, force: true })
 cpSync(FIXTURE_PROFILE, PROFILE_DIR, { recursive: true })
+for (const name of ['demo-plugin', 'git-plugin']) {
+  const dir = join(PROFILE_DIR, 'node_modules', name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, main: 'index.js' }))
+  writeFileSync(join(dir, 'index.js'), 'export function apply() {}')
+}
 
 /** The commit the lockfile pins at the start, and the newer one the fake remote reports. */
 const PINNED_BEFORE = '89abcdef0123456789abcdef0123456789abcdef'
@@ -166,14 +172,18 @@ root.provide('connection', {
  * (The "no subprocess at all" degrade path is covered in verify-all.mjs, where it belongs.)
  */
 const invokedArgv = []
+let gitPackageName = 'git-plugin'
 root.provide('subprocess', {
   spawn({ argv }) {
     invokedArgv.push(argv)
     const isLsRemote = argv[0] === 'git' && argv[1] === 'ls-remote'
     const isView = argv.includes('view')
+    const isGitManifest = argv[0] === 'git' && argv.includes('show')
     // A git query answers `<sha>\t<ref>`; a registry query prints the newest version as JSON.
     const stdout = isLsRemote
       ? `${GIT_HEAD}\t${String(argv[argv.length - 1])}\n`
+      : isGitManifest
+        ? JSON.stringify({ name: gitPackageName })
       : isView
         ? '"1.1.0"\n'
         : ''
@@ -251,6 +261,14 @@ if (route !== undefined) {
   const localStart = await (await route.fetch(envelope('upgrade.start', { name: 'local-plugin', requestId: 'run-local' }))).json()
   ok('a link dependency upgrade is refused', localStart.result?.ok === false, JSON.stringify(localStart.result))
   ok('the link refusal says there is no remote', /本地依赖/.test(String(localStart.result?.error?.message)), String(localStart.result?.error?.message))
+
+  gitPackageName = 'renamed-plugin'
+  const installsBeforeRename = installSpecs.length
+  const renamed = await (await route.fetch(envelope('upgrade.start', { name: 'git-plugin', requestId: 'run-renamed' }))).json()
+  ok('a renamed Git target is refused before installation', renamed.result?.error?.code === 'plugin-upgrader/package-renamed', JSON.stringify(renamed.result))
+  ok('the refused rename never calls installBundle', installSpecs.length === installsBeforeRename, JSON.stringify(installSpecs))
+  ok('a refused rename leaves the lockfile untouched', readFileSync(join(PROFILE_DIR, 'pnpm-lock.yaml'), 'utf8').includes(PINNED_BEFORE))
+  gitPackageName = 'git-plugin'
 
   // The git dependency CAN be resolved: its spec is the name-qualified, commit-pinned URL.
   const gitStart = await (await route.fetch(envelope('upgrade.start', { name: 'git-plugin', requestId: 'run-git' }))).json()
