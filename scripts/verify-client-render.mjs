@@ -677,5 +677,131 @@ for (const subject of weirdSubjects) {
   )
 }
 
+// ------------------------------------------------- a REFUSED upgrade must stay on screen
+// THE COVERAGE GAP THAT HID A LIVE BUG. The stub connection answers EVERY `upgrade.start` with
+// success, so nothing above exercises a Host REFUSAL — and a refusal arrives through a different
+// channel (`setError`) than a settled verdict. The client's automatic follow-up re-check cleared
+// that channel, so a refused upgrade (the upstream had renamed the package) rendered as a button
+// that did nothing at all. This drives the same tab against a refusing connection.
+console.log('\n# a refused upgrade is reported, not silently swallowed')
+{
+  const refusalMessage = '已停止升级：当前依赖名为 git-plugin，目标提交声明的包名为 renamed-plugin。当前安装未修改。'
+  const refusalConn = {
+    rpc: {
+      call(channel, endpoint, payload) {
+        const only = payload.payload?.name
+        if (payload.method === 'list') {
+          return Promise.resolve({ ok: true, value: {
+            profile: 'C:/fake', registry: null, ttlMs: 1000, checkedAt: null,
+            summary: summarize(CHECKED.map((r) => ({ ...r, status: 'unchecked' }))),
+            plugins: CHECKED.map((r) => ({ ...r, status: 'unchecked', upgradable: false, target: null })),
+          } })
+        }
+        if (payload.method === 'check') {
+          const plugins = typeof only === 'string' ? CHECKED.filter((r) => r.name === only) : CHECKED
+          return Promise.resolve({ ok: true, value: {
+            profile: 'C:/fake', registry: null, ttlMs: 1000, checkedAt: Date.now(),
+            summary: summarize(plugins), plugins,
+          } })
+        }
+        // The Host refuses, correctly and with a readable reason.
+        if (payload.method === 'upgrade.start') {
+          return Promise.resolve({ ok: false, error: { code: 'plugin-upgrader/package-renamed', message: refusalMessage } })
+        }
+        if (payload.method === 'upgrade.status') return Promise.resolve({ ok: true, value: { run: null, verdict: null } })
+        return Promise.resolve({ ok: false, error: { code: 'test/unknown', message: payload.method } })
+      },
+    },
+  }
+
+  const previousConnection = connection.rpc.call
+  connection.rpc.call = refusalConn.rpc.call
+  try {
+    // Mount ONCE and keep the same hook cell across every pass. `clickAndRender` builds a fresh
+    // cell per call, which would discard the very state under test — and a fresh cell would make
+    // this assertion pass or fail for the wrong reason.
+    const { Component, definition } = tabReg
+    const cell = []
+    const hooks = makeHooks(cell, [])
+    const saved = { useState: React.useState, useEffect: React.useEffect, useCallback: React.useCallback, useRef: React.useRef }
+    Object.assign(React, { useState: hooks.useState, useEffect: hooks.useEffect, useCallback: hooks.useCallback, useRef: hooks.useRef })
+
+    let tree = null
+    /**
+     * Render one pass against the SAME cell.
+     *
+     * Effects are flushed ONCE, at mount. The stand-in `useEffect` ignores its dependency array,
+     * so flushing on every pass would re-run the mount effect — which calls `list()` and would
+     * overwrite the checked roster with the unchecked one, making this test assert against the
+     * wrong state for reasons that have nothing to do with what is under test.
+     */
+    let effectsFlushed = false
+    const pass = () => {
+      hooks.__reset()
+      pendingEffects = []
+      const injected = definition.inject ? definition.inject() : {}
+      tree = Component({ ...injected, t: (key) => key })
+      if (!effectsFlushed) {
+        effectsFlushed = true
+        for (const effect of pendingEffects) {
+          try {
+            const cleanup = effect()
+            if (typeof cleanup === 'function') cleanup()
+          } catch { /* an effect throwing is covered elsewhere */ }
+        }
+      }
+      pendingEffects = []
+    }
+    /** Click every button whose text matches, then let the RPC promises settle. */
+    const click = async (pattern) => {
+      pass()
+      const buttons = collect(expand(tree), (el) => el.type === 'button' && pattern.test(textOf(el)))
+      for (const button of buttons) {
+        if (typeof button.props?.onClick === 'function') button.props.onClick({ preventDefault() {}, stopPropagation() {} })
+      }
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        pass()
+      }
+      return buttons.length
+    }
+
+    pass()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    pass()
+
+    // "检查更新" first: the tab only shows action buttons once it has a checked roster. The
+    // roster is (re)loaded by the mount effect, so this must run after that has settled.
+    await click(/^检查更新$/)
+    const afterCheckText = textOf(expand(tree))
+    ok(
+      'the checked roster offers an upgrade button',
+      /升级到|^升级$/.test(afterCheckText),
+      afterCheckText.slice(0, 800),
+    )
+
+    const upgradeClicks = await click(/^升级到|^升级$/)
+    ok('the refusing Host received the upgrade request', upgradeClicks >= 1, afterCheckText.slice(0, 600))
+
+    // The critical waits: `upgrade.start` rejects, then the AUTOMATIC follow-up re-check runs —
+    // the step that used to erase the message.
+    for (let i = 0; i < 6; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      pass()
+    }
+
+    const finalText = textOf(expand(tree))
+    ok(
+      'the refusal reason reaches the user',
+      finalText.includes('已停止升级') || finalText.includes('package-renamed') || finalText.includes('renamed-plugin'),
+      finalText.slice(0, 1200),
+    )
+
+    Object.assign(React, saved)
+  } finally {
+    connection.rpc.call = previousConnection
+  }
+}
+
 console.log(`\n${failures === 0 ? 'PASS' : 'FAIL'} — client render checks`)
 process.exit(failures === 0 ? 0 : 1)
