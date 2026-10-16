@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 
 import { CheckCache } from '../lib/cache.js'
 import { buildCandidates, classifyBundleRow } from '../lib/discover.js'
-import { checkCandidate, parseViewVersion } from '../lib/registry.js'
+import { checkCandidate, isTransientGitFailure, parseViewVersion, runRemoteGit } from '../lib/registry.js'
 import {
   SHAPE,
   classifySpecifier,
@@ -189,6 +189,95 @@ is('a slashed branch is a ref', gitRefOf(`${GIT_URL}#feature/x`), 'feature/x')
 is('git+ does not confuse ref extraction', gitRefOf(`git+${GIT_URL}#develop`), 'develop')
 is('an empty fragment means HEAD', gitRefOf(`${GIT_URL}#`), null)
 is('a non-string yields no ref', gitRefOf(undefined), null)
+
+// ------------------------------------------------- transient remote-git failures are retried
+// MEASURED, and the reason this exists: gitee answers the very same `git ls-remote` for the very
+// same public URL with `HTTP/1.1 401 Unauthorized` about 40% of the time (raw HTTP, no git
+// involved: 10 probes -> 200 200 401 401 200 200 200 401 200 200). git treats a 401 as an
+// authentication failure and does NOT retry it, so one unlucky attempt reached the user as
+// "远端不可达" while the remote was reachable a moment later. Without retries, roughly one
+// upgrade attempt in three failed for no real reason.
+console.log('\n# a flaky remote is retried, but only for transient symptoms')
+ok('the gitee 401 is recognised as transient', isTransientGitFailure(
+  "fatal: could not read Username for 'https://gitee.com': terminal prompts disabled",
+) === true)
+ok('an HTTP 401 is transient', isTransientGitFailure('error: The requested URL returned error: 401') === true)
+ok('an HTTP 429 is transient', isTransientGitFailure('error: The requested URL returned error: 429') === true)
+ok('an HTTP 503 is transient', isTransientGitFailure('error: The requested URL returned error: 503') === true)
+ok('a TLS/EOF cut is transient', isTransientGitFailure('error: RPC failed; curl 56 OpenSSL SSL_read: unexpected eof') === true)
+ok('a connection reset is transient', isTransientGitFailure('fatal: unable to access … Connection reset by peer') === true)
+ok('a DNS failure is transient', isTransientGitFailure('fatal: unable to access … Could not resolve host: gitee.com') === true)
+
+// Negative controls. Retrying a genuinely broken spec wastes attempts and delays the real error,
+// so the detector must NOT swallow these.
+is('a missing git binary is NOT transient', isTransientGitFailure("'git' is not recognized as an internal or external command"), false)
+is('a malformed spec is NOT transient', isTransientGitFailure('fatal: invalid refspec HEAD~'), false)
+is('an empty output is NOT transient', isTransientGitFailure(''), false)
+is('a non-string is NOT transient', isTransientGitFailure(undefined), false)
+
+// The retry LOOP itself, not just the classifier: a stub that fails twice then succeeds must be
+// asked three times and must come back successful. This is the behaviour that turns the measured
+// gitee coin-flip into a dependable query.
+console.log('\n# runRemoteGit retries until success and stops as soon as one succeeds')
+/** Build a ctx whose git spawns follow a scripted sequence of exit codes. */
+function scriptedCtx(exitCodes) {
+  const spawns = []
+  return {
+    spawns,
+    ctx: {
+      subprocess: {
+        spawn({ argv }) {
+          spawns.push(argv)
+          const code = exitCodes[Math.min(spawns.length - 1, exitCodes.length - 1)]
+          const reader = (text) => ({ readFrom: () => ({ text }) })
+          return {
+            done: Promise.resolve({ exitCode: code }),
+            collected: {
+              stdout: reader(code === 0 ? '0123456789abcdef0123456789abcdef01234567\tHEAD\n' : ''),
+              stderr: reader(code === 0 ? '' : "fatal: could not read Username for 'https://gitee.com': terminal prompts disabled"),
+            },
+          }
+        },
+      },
+    },
+  }
+}
+const retryProfile = { dir: root, packageManager: undefined }
+const retryArgv = ['git', '-c', 'credential.helper=', 'ls-remote', 'https://git.example.com/a/b.git', 'HEAD']
+
+const twoThenOk = scriptedCtx([128, 128, 0])
+const retried = await runRemoteGit({ ctx: twoThenOk.ctx, profile: retryProfile, argv: retryArgv })
+is('a query that fails twice then succeeds ends as success', retried.exitCode, 0)
+is('it took exactly three attempts', retried.attempts, 3)
+is('the stub was invoked three times', twoThenOk.spawns.length, 3)
+ok('every attempt disables the credential helper',
+  twoThenOk.spawns.every((argv) => argv.includes('credential.helper=')), JSON.stringify(twoThenOk.spawns[0]))
+
+const okFirst = scriptedCtx([0])
+const firstTry = await runRemoteGit({ ctx: okFirst.ctx, profile: retryProfile, argv: retryArgv })
+is('a query that succeeds immediately is not retried', okFirst.spawns.length, 1)
+is('and reports one attempt', firstTry.attempts, 1)
+
+// A NON-transient failure must stop at once: retrying a broken spec three times would only delay
+// the real error the user needs to read.
+const fatalOnly = scriptedCtx([128])
+fatalOnly.ctx.subprocess.spawn = ((original) => ({ argv }) => {
+  const handle = original({ argv })
+  handle.collected.stderr = { readFrom: () => ({ text: "'git' is not recognized as an internal or external command" }) }
+  return handle
+})(fatalOnly.ctx.subprocess.spawn)
+const notRetried = await runRemoteGit({ ctx: fatalOnly.ctx, profile: retryProfile, argv: retryArgv })
+is('a non-transient failure is attempted only once', fatalOnly.spawns.length, 1)
+is('and still reports the failure', notRetried.exitCode, 128)
+
+// A pre-aborted signal must return a well-formed result, not `undefined` — callers read
+// `exitCode`/`stderr` unconditionally, and "exit code undefined" is a useless message.
+const aborted = scriptedCtx([0])
+const controller = new AbortController()
+controller.abort()
+const cancelled = await runRemoteGit({ ctx: aborted.ctx, profile: retryProfile, argv: retryArgv, signal: controller.signal })
+ok('an aborted run yields a well-formed result', typeof cancelled.exitCode === 'number' || cancelled.exitCode === null, JSON.stringify(cancelled))
+ok('and does not spawn git', aborted.spawns.length === 0, JSON.stringify(aborted.spawns.length))
 
 console.log('\n# lockfile parsing (synthetic fixture, all three shapes)')
 const lockText = await readFile(join(root, 'scripts', 'fixtures', 'pnpm-lock.yaml'), 'utf8')
