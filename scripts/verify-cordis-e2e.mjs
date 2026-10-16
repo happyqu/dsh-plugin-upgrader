@@ -258,6 +258,14 @@ if (route !== undefined) {
   // resolves `name@version` rather than re-installing the range.
   ok('a registry upgrade resolves to name@version', started.result?.ok === true, JSON.stringify(started.result))
 
+  const busyStart = await (await route.fetch(envelope('upgrade.start', { name: 'git-plugin', requestId: 'run-busy' }))).json()
+  ok('concurrent upgrade is refused until installation and verification finish', busyStart.result?.error?.code === 'plugin-upgrader/busy', JSON.stringify(busyStart.result))
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const status = await (await route.fetch(envelope('upgrade.status', { requestId: 'run-1' }))).json()
+    if (status.result?.value?.run?.running === false) break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+
   const localStart = await (await route.fetch(envelope('upgrade.start', { name: 'local-plugin', requestId: 'run-local' }))).json()
   ok('a link dependency upgrade is refused', localStart.result?.ok === false, JSON.stringify(localStart.result))
   ok('the link refusal says there is no remote', /本地依赖/.test(String(localStart.result?.error?.message)), String(localStart.result?.error?.message))
