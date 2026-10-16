@@ -176,7 +176,10 @@ let gitPackageName = 'git-plugin'
 root.provide('subprocess', {
   spawn({ argv }) {
     invokedArgv.push(argv)
-    const isLsRemote = argv[0] === 'git' && argv[1] === 'ls-remote'
+    // Match on `includes`, not on a fixed index: the query carries `-c credential.helper=`
+    // before the subcommand (that flag is what stops Git Credential Manager popping a GUI
+    // prompt during a background install), so `argv[1]` is no longer the subcommand.
+    const isLsRemote = argv[0] === 'git' && argv.includes('ls-remote')
     const isView = argv.includes('view')
     const isGitManifest = argv[0] === 'git' && argv.includes('show')
     // A git query answers `<sha>\t<ref>`; a registry query prints the newest version as JSON.
@@ -311,7 +314,26 @@ if (route !== undefined) {
   ok('the git spec pins the resolved commit', gitSpec.includes(`#${GIT_HEAD}`), gitSpec)
   ok(
     'the remote was read before the spec was built',
-    invokedArgv.some((argv) => argv[0] === 'git' && argv[1] === 'ls-remote'),
+    invokedArgv.some((argv) => argv[0] === 'git' && argv.includes('ls-remote')),
+    JSON.stringify(invokedArgv),
+  )
+  // The credential helper MUST be disabled for every git call that touches a REMOTE. Without it
+  // a private remote opens Git Credential Manager's GUI prompt during a background install, which
+  // nothing can dismiss and which stalls the whole upgrade — an observed live failure.
+  //
+  // Only network-touching subcommands are checked: `git init` and `git show` run entirely inside
+  // a temporary directory and never contact a remote, so they have no prompt to suppress.
+  const REMOTE_SUBCOMMANDS = ['ls-remote', 'fetch', 'clone', 'pull', 'push']
+  const remoteArgvs = invokedArgv.filter((argv) => argv[0] === 'git' && argv.some((a) => REMOTE_SUBCOMMANDS.includes(a)))
+  ok(
+    'every remote-touching git call disables the credential helper',
+    remoteArgvs.length > 0 && remoteArgvs.every((argv) => argv.includes('-c') && argv.includes('credential.helper=')),
+    JSON.stringify(remoteArgvs.filter((argv) => !(argv.includes('-c') && argv.includes('credential.helper=')))),
+  )
+  // And the plugin must actually make such calls, or the assertion above proves nothing.
+  ok(
+    'the plugin did make a remote-touching git call',
+    remoteArgvs.length > 0,
     JSON.stringify(invokedArgv),
   )
 
